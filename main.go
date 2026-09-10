@@ -33,11 +33,8 @@ const (
 )
 
 var razorpayURLs = []string{
-	"https://pages.razorpay.com/lckuk-international",
 	"https://pages.razorpay.com/iicdelhi",
-	"https://razorpay.me/@onsiteteams",
-	"https://razorpay.me/@getitservice",
-	"https://razorpay.me/@plp",
+	
 }
 
 var (
