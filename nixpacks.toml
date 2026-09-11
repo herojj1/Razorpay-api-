@@ -1,11 +1,12 @@
 [phases.setup]
-nixPkgs = ["python311", "pip", "gcc", "pkg-config", "libffi", "openssl"]
+nixPkgs = ["python311", "gcc", "pkg-config", "libffi", "openssl"]
 
 [phases.install]
 cmds = [
-    "python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel",
-    "python3 -m pip install --no-cache-dir -r requirements.txt"
+    "python3 -m venv /opt/venv",
+    "/opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel",
+    "/opt/venv/bin/pip install --no-cache-dir -r requirements.txt"
 ]
 
 [start]
-cmd = "python3 -m uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --loop uvloop --http httptools --log-level warning"
+cmd = "/opt/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --loop uvloop --http httptools --log-level warning"
