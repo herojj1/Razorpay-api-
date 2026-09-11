@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python311", "gcc", "gxx", "libffi", "openssl"]
+
+[phases.install]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
+
+[start]
+cmd = "python -m uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --loop uvloop --http httptools --log-level warning"
