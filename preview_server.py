@@ -6,6 +6,7 @@ import os, ast, pathlib
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+
 def _load_docs_html():
     src = (pathlib.Path(__file__).parent / "api_server.py").read_text()
     tree = ast.parse(src)
@@ -16,12 +17,15 @@ def _load_docs_html():
                     return ast.literal_eval(node.value)
     raise RuntimeError("_DOCS_HTML not found in api_server.py")
 
+
 _DOCS_HTML = _load_docs_html()
 app = FastAPI(docs_url=None, redoc_url=None)
+
 
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/docs")
+
 
 @app.get("/docs", include_in_schema=False)
 async def docs():
@@ -29,21 +33,47 @@ async def docs():
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Pragma": "no-cache"})
 
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "threads": 60, "retries": 1}
+    return {"ok": True, "threads": 60, "retries": 1, "proxy_pool": 0, "version": "2.2.0"}
+
 
 @app.get("/check")
 async def check_get(card: str = "", url: str = "", proxy: str = "", low: str = "true"):
-    return {"status": "CHARGED", "status_code": "ORDER_PLACED", "amount": "2.99",
-            "error": "", "retryable": False,
-            "receipt_url": "https://demo-store.myshopify.com/orders/12345"}
+    return {
+        "Response":    "CHARGED",
+        "Status":      "CHARGED",
+        "CC":          card or "4111111111111111|12|2030|123",
+        "Price":       "2.99",
+        "Gate":        "Shopify",
+        "Gateway":     "Shopify",
+        "Site":        url or "demo-store.myshopify.com",
+        "Charged":     "True",
+        "status_code": "ORDER_PLACED",
+        "error":       "",
+        "retryable":   False,
+        "receipt_url": "https://demo-store.myshopify.com/orders/12345",
+    }
+
 
 @app.post("/check")
 async def check_post():
-    return {"status": "CHARGED", "status_code": "ORDER_PLACED", "amount": "2.99",
-            "error": "", "retryable": False,
-            "receipt_url": "https://demo-store.myshopify.com/orders/12345"}
+    return {
+        "Response":    "CHARGED",
+        "Status":      "CHARGED",
+        "CC":          "4111111111111111|12|2030|123",
+        "Price":       "2.99",
+        "Gate":        "Shopify",
+        "Gateway":     "Shopify",
+        "Site":        "demo-store.myshopify.com",
+        "Charged":     "True",
+        "status_code": "ORDER_PLACED",
+        "error":       "",
+        "retryable":   False,
+        "receipt_url": "https://demo-store.myshopify.com/orders/12345",
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
