@@ -1,7 +1,13 @@
 """
-CardCheckout API — Server Entry Point (v2.0.1)
+CardCheckout API — Server Entry Point (v2.0.2)
 ==============================================
 FastAPI server exposing the Shopify checkout engine as an HTTP API.
+
+Change log v2.0.2 (from v2.0.1):
+    - Added Status field to CheckResponse (bot.py compatibility)
+    - _build_response now populates both Response and Status
+    - Lowered default CHECKER_THREADS from 200 to 60
+    - Added INFO-level log line per hit
 
 Endpoints
 ---------
@@ -16,7 +22,7 @@ POST /check  (JSON body)
 
 Environment variables
 ---------------------
-CHECKER_THREADS  — thread-pool size (default 200)
+CHECKER_THREADS  — thread-pool size (default 60)
 CHECKER_RETRIES  — auto-retry count on retryable errors (default 1)
 PORT             — listen port (default 8000)
 """
@@ -46,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cardcheckout.api")
 
-THREAD_WORKERS = int(os.environ.get("CHECKER_THREADS", "200"))
+THREAD_WORKERS = int(os.environ.get("CHECKER_THREADS", "60"))
 MAX_RETRIES    = int(os.environ.get("CHECKER_RETRIES", "1"))
 
 import threading as _threading
@@ -74,7 +80,7 @@ def _dec_active():
 
 app = FastAPI(
     title="CardCheckout API",
-    version="2.0.1",
+    version="2.0.2",
     description="Shopify card-check API.",
     docs_url=None,
     redoc_url=None,
@@ -96,7 +102,7 @@ h1{color:#a78bfa}code{background:#1a1a2a;padding:2px 6px;border-radius:4px;font-
 pre{background:#0a0a14;padding:14px;border-radius:8px;overflow-x:auto;font-size:12px;color:#c4b5fd}
 .ok{color:#34d399}.warn{color:#fbbf24}</style>
 </head><body>
-<h1>CardCheckout API v2.0.1</h1>
+<h1>CardCheckout API v2.0.2</h1>
 <p>Returns <span class=ok>CHARGED</span> only when Shopify confirms a <b>real order</b>.</p>
 <div class=card><b>GET /health</b><pre>curl /health</pre></div>
 <div class=card><b>GET /check</b><pre>curl "/check?url=shop.com&card=NUM|MM|YYYY|CVV&proxy=USER:PASS@HOST:PORT"</pre></div>
@@ -114,6 +120,7 @@ class CheckRequest(BaseModel):
 
 class CheckResponse(BaseModel):
     Response:    str  = "ERROR"
+    Status:      str  = ""
     CC:          str  = ""
     Price:       str  = ""
     Gate:        str  = "Shopify"
@@ -128,14 +135,14 @@ class CheckResponse(BaseModel):
 def _validate_proxy(raw: str) -> Tuple[Optional[str], Optional[CheckResponse]]:
     if not raw or not raw.strip():
         return None, CheckResponse(
-            Response="ERROR", status_code="PROXY_REQUIRED",
+            Response="ERROR", Status="ERROR", status_code="PROXY_REQUIRED",
             error="proxy is required — e.g. http://user:pass@1.2.3.4:8080",
             retryable=False)
     try:
         return normalize_proxy(raw), None
     except Exception as exc:
         return None, CheckResponse(
-            Response="ERROR", status_code="PROXY_INVALID",
+            Response="ERROR", Status="ERROR", status_code="PROXY_INVALID",
             error=f"Invalid proxy format: {exc}", retryable=False)
 
 
@@ -143,19 +150,19 @@ def _validate_card(raw: str) -> Tuple[Optional[str], Optional[CheckResponse]]:
     import datetime as _dt
     if not raw or not raw.strip():
         return None, CheckResponse(
-            Response="ERROR", status_code="CARD_REQUIRED",
+            Response="ERROR", Status="ERROR", status_code="CARD_REQUIRED",
             error="card is required — format: number|mm|yyyy|cvv",
             retryable=False)
     try:
         _num, _month, _year, _cvv = parse_card_entry(raw)
     except Exception as exc:
         return None, CheckResponse(
-            Response="ERROR", status_code="CARD_INVALID",
+            Response="ERROR", Status="ERROR", status_code="CARD_INVALID",
             error=f"invalid card format: {exc}", retryable=False)
     now = _dt.datetime.utcnow()
     if _year < now.year or (_year == now.year and _month < now.month):
         return None, CheckResponse(
-            Response="ERROR", status_code="CARD_EXPIRED",
+            Response="ERROR", Status="ERROR", status_code="CARD_EXPIRED",
             error=f"card expired: {_month:02d}/{_year}", retryable=False)
     return raw.strip(), None
 
@@ -164,7 +171,7 @@ def _validate_url(raw: str) -> Tuple[Optional[str], Optional[CheckResponse]]:
     import urllib.parse as _up
     if not raw or not raw.strip():
         return None, CheckResponse(
-            Response="ERROR", status_code="URL_REQUIRED",
+            Response="ERROR", Status="ERROR", status_code="URL_REQUIRED",
             error="shop url is required — e.g. https://store.myshopify.com",
             retryable=False)
     url = raw.strip()
@@ -177,7 +184,7 @@ def _validate_url(raw: str) -> Tuple[Optional[str], Optional[CheckResponse]]:
             raise ValueError(hostname)
     except Exception:
         return None, CheckResponse(
-            Response="ERROR", status_code="URL_INVALID",
+            Response="ERROR", Status="ERROR", status_code="URL_INVALID",
             error=f"invalid shop url: {raw!r}", retryable=False)
     return url, None
 
@@ -186,6 +193,7 @@ def _build_response(res, shop_url: str = "") -> CheckResponse:
     status_name = res.status.name
     return CheckResponse(
         Response    = status_name,
+        Status      = status_name,
         CC          = res.card or "",
         Price       = res.amount or "",
         Gate        = "Shopify",
@@ -211,7 +219,7 @@ async def _run_check(shop_url: str, card: str, proxy_url: str, low: bool) -> Che
             res = await loop.run_in_executor(_pool, fn)
         except Exception as exc:
             logger.warning("attempt %d/%d — unhandled exception: %s", attempt, attempts, exc)
-            last = CheckResponse(Response="ERROR", error=str(exc), retryable=True)
+            last = CheckResponse(Response="ERROR", Status="ERROR", error=str(exc), retryable=True)
             continue
         finally:
             _dec_active()
@@ -249,7 +257,7 @@ async def health():
         "threads":       THREAD_WORKERS,
         "retries":       MAX_RETRIES,
         "active_checks": active,
-        "version":       "2.0.1",
+        "version":       "2.0.2",
     }
 
 
