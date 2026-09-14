@@ -1,35 +1,9 @@
 """
-CardCheckout API — Server Entry Point (v2.0.3)
-==============================================
-FastAPI server exposing the Shopify checkout engine as an HTTP API.
-
-Change log v2.0.3 (from v2.0.2):
-    - _run_check now logs result.error and retryable flag
-    - Step failures are visible in Railway logs
-
-Change log v2.0.2 (from v2.0.1):
-    - Added Status field to CheckResponse (bot.py compatibility)
-    - Lowered default CHECKER_THREADS from 200 to 60
-
-Endpoints
----------
-GET  /health
-    Returns service status and configuration.
-
-GET  /check?card=NUM|MM|YYYY|CVV&url=SHOP_URL&proxy=http://user:pass@host:port[&low=true]
-    Check a card via query parameters.
-
-POST /check  (JSON body)
-    Check a card via JSON body.
-
-Environment variables
----------------------
-CHECKER_THREADS  — thread-pool size (default 60)
-CHECKER_RETRIES  — auto-retry count on retryable errors (default 1)
-PORT             — listen port (default 8000)
+CardCheckout API — Server Entry Point (v2.2.0)
 """
 
 import os
+import random
 import asyncio
 import concurrent.futures
 import functools
@@ -45,6 +19,7 @@ from checkout_engine import (
     run_checkout_for_card,
     normalize_proxy,
     parse_card_entry,
+    PROXY_POOL,
 )
 
 logging.basicConfig(
@@ -82,7 +57,7 @@ def _dec_active():
 
 app = FastAPI(
     title="CardCheckout API",
-    version="2.0.3",
+    version="2.2.0",
     description="Shopify card-check API.",
     docs_url=None,
     redoc_url=None,
@@ -104,7 +79,7 @@ h1{color:#a78bfa}code{background:#1a1a2a;padding:2px 6px;border-radius:4px;font-
 pre{background:#0a0a14;padding:14px;border-radius:8px;overflow-x:auto;font-size:12px;color:#c4b5fd}
 .ok{color:#34d399}.warn{color:#fbbf24}</style>
 </head><body>
-<h1>CardCheckout API v2.0.3</h1>
+<h1>CardCheckout API v2.2.0</h1>
 <p>Returns <span class=ok>CHARGED</span> only when Shopify confirms a <b>real order</b>.</p>
 <div class=card><b>GET /health</b><pre>curl /health</pre></div>
 <div class=card><b>GET /check</b><pre>curl "/check?url=shop.com&card=NUM|MM|YYYY|CVV&proxy=USER:PASS@HOST:PORT"</pre></div>
@@ -126,6 +101,7 @@ class CheckResponse(BaseModel):
     CC:          str  = ""
     Price:       str  = ""
     Gate:        str  = "Shopify"
+    Gateway:     str  = "Shopify"
     Site:        str  = ""
     Charged:     str  = "False"
     status_code: str  = ""
@@ -191,6 +167,14 @@ def _validate_url(raw: str) -> Tuple[Optional[str], Optional[CheckResponse]]:
     return url, None
 
 
+def _mask_proxy(p: str) -> str:
+    if not p:
+        return "-"
+    if "@" in p:
+        return "…@" + p.rsplit("@", 1)[1]
+    return p
+
+
 def _build_response(res, shop_url: str = "") -> CheckResponse:
     status_name = res.status.name
     return CheckResponse(
@@ -199,6 +183,7 @@ def _build_response(res, shop_url: str = "") -> CheckResponse:
         CC          = res.card or "",
         Price       = res.amount or "",
         Gate        = "Shopify",
+        Gateway     = "Shopify",
         Site        = shop_url or res.shop_url or "",
         Charged     = "True" if status_name == "CHARGED" else "False",
         status_code = res.status_code or "",
@@ -220,7 +205,7 @@ async def _run_check(shop_url: str, card: str, proxy_url: str, low: bool) -> Che
             fn  = functools.partial(run_checkout_for_card, shop_url, card, proxy_url, low)
             res = await loop.run_in_executor(_pool, fn)
         except Exception as exc:
-            logger.warning("attempt %d/%d — unhandled exception: %s", attempt, attempts, exc)
+            logger.warning("attempt %d/%d — unhandled exception: %r", attempt, attempts, exc)
             last = CheckResponse(Response="ERROR", Status="ERROR", error=str(exc), retryable=True)
             continue
         finally:
@@ -228,9 +213,9 @@ async def _run_check(shop_url: str, card: str, proxy_url: str, low: bool) -> Che
 
         resp = _build_response(res, shop_url)
         logger.info(
-            "attempt %d/%d | status=%-8s code=%-24s elapsed=%.1fs",
+            "attempt %d/%d | status=%-8s code=%-24s proxy=%-30s elapsed=%.1fs",
             attempt, attempts, resp.Response, resp.status_code or "-",
-            time.perf_counter() - t0,
+            _mask_proxy(proxy_url), time.perf_counter() - t0,
         )
         if resp.error:
             logger.warning("  ↳ error: %s", resp.error)
@@ -243,7 +228,15 @@ async def _run_check(shop_url: str, card: str, proxy_url: str, low: bool) -> Che
             )
         if not resp.retryable or attempt == attempts:
             return resp
-        logger.info("retrying (retryable=true) …")
+
+        if PROXY_POOL:
+            candidates = [p for p in PROXY_POOL if p != proxy_url] or PROXY_POOL
+            new_proxy = random.choice(candidates)
+            logger.info("retrying (retryable=true) — rotating proxy %s → %s",
+                        _mask_proxy(proxy_url), _mask_proxy(new_proxy))
+            proxy_url = new_proxy
+        else:
+            logger.info("retrying (retryable=true) — no PROXY_POOL, reusing proxy")
         last = resp
 
     return last
@@ -263,7 +256,8 @@ async def health():
         "threads":       THREAD_WORKERS,
         "retries":       MAX_RETRIES,
         "active_checks": active,
-        "version":       "2.0.3",
+        "proxy_pool":    len(PROXY_POOL),
+        "version":       "2.2.0",
     }
 
 
@@ -316,6 +310,6 @@ async def check_post(req: CheckRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
-    logger.info("CardCheckout API — port=%d threads=%d retries=%d",
-                port, THREAD_WORKERS, MAX_RETRIES)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    logger.info("CardCheckout API — port=%d threads=%d retries=%d proxy_pool=%d",
+                port, THREAD_WORKERS, MAX_RETRIES, len(PROXY_POOL))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
