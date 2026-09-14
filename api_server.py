@@ -1,13 +1,15 @@
 """
-CardCheckout API — Server Entry Point (v2.0.2)
+CardCheckout API — Server Entry Point (v2.0.3)
 ==============================================
 FastAPI server exposing the Shopify checkout engine as an HTTP API.
 
+Change log v2.0.3 (from v2.0.2):
+    - _run_check now logs result.error and retryable flag
+    - Step failures are visible in Railway logs
+
 Change log v2.0.2 (from v2.0.1):
     - Added Status field to CheckResponse (bot.py compatibility)
-    - _build_response now populates both Response and Status
     - Lowered default CHECKER_THREADS from 200 to 60
-    - Added INFO-level log line per hit
 
 Endpoints
 ---------
@@ -80,7 +82,7 @@ def _dec_active():
 
 app = FastAPI(
     title="CardCheckout API",
-    version="2.0.2",
+    version="2.0.3",
     description="Shopify card-check API.",
     docs_url=None,
     redoc_url=None,
@@ -102,7 +104,7 @@ h1{color:#a78bfa}code{background:#1a1a2a;padding:2px 6px;border-radius:4px;font-
 pre{background:#0a0a14;padding:14px;border-radius:8px;overflow-x:auto;font-size:12px;color:#c4b5fd}
 .ok{color:#34d399}.warn{color:#fbbf24}</style>
 </head><body>
-<h1>CardCheckout API v2.0.2</h1>
+<h1>CardCheckout API v2.0.3</h1>
 <p>Returns <span class=ok>CHARGED</span> only when Shopify confirms a <b>real order</b>.</p>
 <div class=card><b>GET /health</b><pre>curl /health</pre></div>
 <div class=card><b>GET /check</b><pre>curl "/check?url=shop.com&card=NUM|MM|YYYY|CVV&proxy=USER:PASS@HOST:PORT"</pre></div>
@@ -230,6 +232,10 @@ async def _run_check(shop_url: str, card: str, proxy_url: str, low: bool) -> Che
             attempt, attempts, resp.Response, resp.status_code or "-",
             time.perf_counter() - t0,
         )
+        if resp.error:
+            logger.warning("  ↳ error: %s", resp.error)
+        if resp.retryable:
+            logger.warning("  ↳ retryable=true")
         if resp.Response in ("CHARGED", "APPROVED"):
             logger.info(
                 "HIT | status=%s | amount=%s | site=%s | receipt=%s",
@@ -257,7 +263,7 @@ async def health():
         "threads":       THREAD_WORKERS,
         "retries":       MAX_RETRIES,
         "active_checks": active,
-        "version":       "2.0.2",
+        "version":       "2.0.3",
     }
 
 
