@@ -1,5 +1,6 @@
 """
 Preview server — serves the /docs UI with mocked endpoints.
+Does NOT import checkout_engine. Safe to run standalone.
 """
 import os, ast, pathlib
 from fastapi import FastAPI
@@ -30,7 +31,7 @@ async def docs():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "threads": 200, "retries": 1}
+    return {"ok": True, "threads": 60, "retries": 1}
 
 @app.get("/check")
 async def check_get(card: str = "", url: str = "", proxy: str = "", low: str = "true"):
