@@ -1,6 +1,6 @@
 #!/bin/bash
 # Card Checkout API - Start Script
-CHECKER_THREADS=${CHECKER_THREADS:-200} \
+CHECKER_THREADS=${CHECKER_THREADS:-60} \
 python3 -u -m uvicorn api_server:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
