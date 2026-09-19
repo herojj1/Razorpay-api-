@@ -23,7 +23,7 @@ import bin_lookup
 # ───────────── CONFIG ─────────────
 API_ID    = int(os.getenv("API_ID") or 33657928)
 API_HASH  = os.getenv("API_HASH", "a61fde61442113b9a65c699f7020d59a")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8517366800:AAGbU4pTheYVVCqMLYDqGvot4pa4FCGQhSw")
 ADMIN_ID  = json.loads(os.getenv("ADMIN_ID", "[8871910561]"))
 
 # Channel to log user uploads
