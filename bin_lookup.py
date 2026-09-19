@@ -26,11 +26,13 @@ async def lookup(bin6: str) -> dict:
 
 async def lookup_many(bins: list) -> dict:
     res = await asyncio.gather(*[lookup(b) for b in bins], return_exceptions=True)
-    return {b: (r if not isinstance(r, Exception) else _empty()) for b, r in zip(bins, res)}
+    return {b: (r if not isinstance(r, Exception) else _empty())
+            for b, r in zip(bins, res)}
 
 
 def _empty():
-    return {"brand": "-", "type": "-", "level": "-", "bank": "-", "country": "-", "flag": ""}
+    return {"brand": "-", "type": "-", "level": "-",
+            "bank": "-", "country": "-", "flag": ""}
 
 
 async def _try_binlist(bin6: str) -> dict:
