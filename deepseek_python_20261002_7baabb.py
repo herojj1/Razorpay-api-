@@ -1,0 +1,1358 @@
+# =============================================================================
+# NOVA Finder — Shopify + Razorpay Site Discovery Bot (v1.0.0)
+# =============================================================================
+# Standalone. Feeds sites.txt / rz_sites.txt for NOVA main bot.
+# - /shsearch [count] [keyword]  → find + test Shopify stores
+# - /rzsearch [count] [keyword]  → find + test Razorpay pages
+# - /shdeep [seed]               → expand from a seed store
+# - /shsave / /rzsave            → download pool as .txt
+# - /shstats / /rzstats          → pool stats
+# - /shclear / /rzclear          → wipe pool
+# - /setapi                       → override endpoints at runtime
+# =============================================================================
+
+import os
+import re
+import json
+import time
+import random
+import logging
+import asyncio
+import hashlib
+from datetime import datetime
+from urllib.parse import urlparse, quote
+from typing import Optional, List
+
+import aiohttp
+import aiofiles
+from telethon import TelegramClient, events, Button
+from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageEntityCustomEmoji
+from telethon.extensions import html as thtml
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+
+# ====================== LOGGING ======================
+log = logging.getLogger("FINDER")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s',
+                          datefmt='%Y-%m-%d %H:%M:%S')
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(_fmt)
+log.addHandler(_ch)
+
+if not os.getenv("RAILWAY_ENVIRONMENT"):
+    try:
+        _fh = logging.FileHandler('nova_finder.log', encoding='utf-8')
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(_fmt)
+        log.addHandler(_fh)
+    except Exception:
+        pass
+
+
+def log_user(uid, action, msg, level="info"):
+    getattr(log, level, log.info)(f"[USER:{uid}] [{action}] {msg}")
+
+
+def log_system(action, msg, level="info"):
+    getattr(log, level, log.info)(f"[SYSTEM] [{action}] {msg}")
+
+
+# ====================== BOLD SANS ======================
+_BOLD_MAP = {}
+_upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_lower = "abcdefghijklmnopqrstuvwxyz"
+_digits = "0123456789"
+_bupper = "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
+_blower = "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
+_bdigits = "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
+for _i, _c in enumerate(_upper): _BOLD_MAP[_c] = _bupper[_i]
+for _i, _c in enumerate(_lower): _BOLD_MAP[_c] = _blower[_i]
+for _i, _c in enumerate(_digits): _BOLD_MAP[_c] = _bdigits[_i]
+
+
+def bs(text):
+    if not text:
+        return text
+    return "".join(_BOLD_MAP.get(c, c) for c in str(text))
+
+
+# ====================== CONFIG ======================
+API_ID    = int(os.getenv("FINDER_API_ID") or os.getenv("API_ID") or 33657928)
+API_HASH  = os.getenv("FINDER_API_HASH") or os.getenv("API_HASH", "a61fde61442113b9a65c699f7020d59a")
+BOT_TOKEN = os.getenv("FINDER_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+ADMIN_ID  = [int(x) for x in (os.getenv("FINDER_ADMINS") or "8871910561").split(",") if x.strip()]
+
+ADMIN_FILE = "finder_admins.json"
+
+
+def _load_admins():
+    global ADMIN_ID
+    try:
+        if os.path.exists(ADMIN_FILE):
+            with open(ADMIN_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                merged = list(dict.fromkeys(
+                    list(ADMIN_ID) + [int(x) for x in data if str(x).lstrip('-').isdigit()]
+                ))
+                ADMIN_ID.clear()
+                ADMIN_ID.extend(merged)
+    except Exception as e:
+        log_system("ADMIN", f"load failed: {e}", "warning")
+
+
+def _save_admins():
+    try:
+        with open(ADMIN_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(ADMIN_ID), f, indent=2)
+    except Exception:
+        pass
+
+
+BOT_BRAND    = "NOVA FINDER"
+BOT_USERNAME = "@novafinderbot"
+OWNER_TAG    = "@SUPERGREMLIN01"
+DEV_LINE     = f"⌬ {bs('By')} <a href='https://t.me/{OWNER_TAG.lstrip('@')}'>{OWNER_TAG}</a>"
+SEP          = "━━━━━━━━━━━━━━━━━"
+PE           = "💎"
+
+# Pools
+SHOPIFY_POOL_FILE = "shopify_pool.txt"
+RZ_POOL_FILE      = "rz_pool.txt"
+SHOPIFY_META_FILE = "shopify_pool_meta.json"
+RZ_META_FILE      = "rz_pool_meta.json"
+
+# API endpoints (for testing sites via the main bot's engine)
+API_DEFAULTS = {
+    "shopify": os.getenv("FINDER_API_BASE_URL",
+                          "https://web-production-e6929.up.railway.app/shopify"),
+    "razorpay": os.getenv("FINDER_RZ_API_URL",
+                          "https://rz.rcvan.indevs.in/rz"),
+}
+API_CONFIG_FILE = "finder_api.json"
+API_TIMEOUT = 60
+
+# Harvest tuning
+MAX_POOL_ADMIN = 100000
+MAX_POOL_USER  = 50000
+TEST_WORKERS   = 60
+TEST_CARD      = "5154623245618097|03|2032|156"
+
+# Shopify seed directory (public JSON listing endpoints)
+SHOPIFY_DIRS = [
+    "https://shop.app/api/search",
+    "https://shop.app/api/storefronts",
+]
+
+# Razorpay slug stems
+RZ_STEMS = [
+    "donate", "donation", "pay", "payment", "paynow", "checkout", "fees",
+    "booking", "book", "order", "store", "shop", "buy", "buynow", "cart",
+    "subscription", "subscribe", "register", "registration", "ticket",
+    "tickets", "entry", "course", "schoolfees", "collegefees", "support",
+    "supportus", "seva", "daan", "help", "sponsor", "fund", "temple",
+    "church", "mandir", "ashram", "trust", "foundation", "ngo", "charity",
+    "welfare", "trial", "starter", "basic", "premium", "annual", "monthly",
+    "payfee", "payfees", "registernow", "joinnow", "join", "member",
+    "membership", "fee", "feespayment", "onlinefee", "donateus",
+]
+
+# Shopify keyword stems (fallback if directory API fails)
+SHOPIFY_STEMS = [
+    "coffee", "tea", "candle", "soap", "skincare", "beauty", "cosmetics",
+    "fashion", "clothing", "apparel", "shoes", "jewelry", "accessories",
+    "bags", "watches", "home", "kitchen", "bedding", "furniture", "decor",
+    "art", "prints", "posters", "toys", "kids", "baby", "pets", "dog",
+    "cat", "fitness", "sports", "outdoor", "camping", "garden", "plants",
+    "tech", "gadgets", "electronics", "books", "stationery", "snacks",
+    "food", "drinks", "wine", "beer", "supplements", "vitamins", "protein",
+    "roasters", "boutique", "vintage", "modern", "organic", "natural",
+    "handmade", "luxury", "minimalist", "sustainable", "eco", "wellness",
+    "selfcare", "shoes", "jeans", "denim", "leather", "wool", "linen",
+    "vitamin", "herbal", "ayurveda", "coffee", "chocolate", "honey",
+]
+
+
+# ====================== PREMIUM EMOJI ======================
+PREMIUM_EMOJI_IDS = {
+    "✅":"5278327121008167894","❌":"5785177332595561481","⚠️":"5420323339723881652",
+    "⚡":"6174996123522959140","🔥":"5039644681583985437","💎":"5427168083074628963",
+    "✨":"5040016479722931047","🎉":"5039778134807806727","🎯":"5039905162760553480",
+    "🛑":"6181277564732972292","💰":"5039789890133296083","💳":"5447453226498552490",
+    "📊":"5042290883949495533","🥇":"6179279816529814743","🏆":"6089185885289454318",
+    "👑":"5039727497143387500","👤":"5992129361090711368","🤖":"6174896506051495705",
+    "⚙️":"5445059250382469069","🌐":"6321225560789877992","🏳️":"5256143829672672750",
+    "📍":"5391032818111363540","📡":"5447448489149625830","🔔":"5042111805288089118",
+    "🛡️":"5042328396193864923","🔑":"5399885604701880145","🔗":"5042101437237036298",
+    "⏱️":"5445350406215465190","🚀":"6174445826543191998","⭐":"5042061201983407048",
+    "🔮":"5042302287087666158","🌍":"5447410659077661506","📝":"5444889156792646660",
+    "📁":"6026239398650056451","🗑":"5039614900280754969","📅":"6168242008277125889",
+    "📥":"5443127283898405358","📤":"5445355530111437729","🟢":"5039928501612839813",
+    "🔴":"5042042652019655612","🟡":"5042036407137207122","🔵":"5042290883949495533",
+    "⏸":"5042036407137207122","📌":"5397782960512444700","📋":"5445260044398524944",
+    "🔧":"5445059250382469069","🔍":"5042302287087666158","💻":"5039579582764680065",
+    "📩":"5443127283898405358","💬":"5040036030414062506","📢":"5447644880824181073",
+    "💡":"5042264341051605743","🛒":"5445224894386172410","📦":"6026239398650056451",
+    "🔙":"5445365692004071819","🎁":"5039778134807806727","👥":"5443038326535759644",
+}
+
+
+def pe(text):
+    if not text:
+        return text
+    out = text
+    for emoji in sorted(PREMIUM_EMOJI_IDS.keys(), key=len, reverse=True):
+        doc_id = PREMIUM_EMOJI_IDS[emoji]
+        out = out.replace(emoji, f'<tg-emoji emoji-id="{doc_id}">{emoji}</tg-emoji>')
+    return out
+
+
+# ====================== MESSAGE HELPERS ======================
+client_instance = None
+
+
+def build_entities(html_text, emoji_ids=None):
+    text, entities = thtml.parse(html_text)
+    if emoji_ids:
+        idx, utf16_pos = 0, 0
+        for ch in text:
+            if ch == PE and idx < len(emoji_ids):
+                entities.append(MessageEntityCustomEmoji(
+                    offset=utf16_pos, length=1, document_id=emoji_ids[idx]))
+                idx += 1
+            utf16_pos += 2 if ord(ch) > 0xFFFF else 1
+    return text, sorted(entities, key=lambda e: e.offset)
+
+
+async def styled_reply(event, html_text, buttons=None, emoji_ids=None, file=None):
+    try:
+        text, entities = build_entities(html_text, emoji_ids)
+        return await asyncio.wait_for(
+            event.reply(text, formatting_entities=entities, buttons=buttons,
+                        file=file, link_preview=False), timeout=15)
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        try:
+            return await asyncio.wait_for(
+                event.reply(html_text[:4000], parse_mode='html', link_preview=False),
+                timeout=10)
+        except Exception:
+            return None
+
+
+async def styled_edit(msg, html_text, buttons=None, emoji_ids=None):
+    try:
+        text, entities = build_entities(html_text, emoji_ids)
+        await asyncio.wait_for(msg.edit(text, formatting_entities=entities,
+                                        buttons=buttons, link_preview=False), timeout=8)
+    except Exception:
+        pass
+
+
+async def send_entities(chat_id, html_text, buttons=None, file=None, **kwargs):
+    try:
+        text, ents = build_entities(html_text)
+        return await client_instance.send_message(
+            chat_id, text, formatting_entities=ents,
+            buttons=buttons, link_preview=False, **kwargs)
+    except Exception as e:
+        log_system("SEND", f"send_entities failed: {e}", "error")
+        return None
+
+
+async def send_file_entities(chat_id, file, html_caption, buttons=None, **kwargs):
+    try:
+        text, ents = build_entities(html_caption)
+        return await client_instance.send_file(
+            chat_id, file, caption=text, formatting_entities=ents,
+            buttons=buttons, **kwargs)
+    except Exception as e:
+        log_system("SEND_FILE", f"send_file_entities failed: {e}", "error")
+        return None
+
+
+def pbtn(text, data=None, url=None):
+    if url:
+        return Button.url(text, url)
+    if data:
+        return Button.inline(text, data.encode() if isinstance(data, str) else data)
+    return Button.inline(text, b"none")
+
+
+# ====================== JSON STORAGE ======================
+def _read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, data):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        log_system("FS", f"write {path} failed: {e}", "error")
+
+
+# ====================== API CONFIG ======================
+def _load_api_config() -> dict:
+    try:
+        if os.path.exists(API_CONFIG_FILE):
+            with open(API_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = dict(API_DEFAULTS)
+            merged.update({k: v for k, v in data.items() if k in API_DEFAULTS})
+            return merged
+    except Exception:
+        pass
+    return dict(API_DEFAULTS)
+
+
+def _save_api_config(cfg: dict):
+    try:
+        with open(API_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+API_CONFIG = _load_api_config()
+
+
+def get_api(name: str) -> str:
+    return API_CONFIG.get(name, API_DEFAULTS.get(name, ""))
+
+
+def set_api(name: str, url: str) -> bool:
+    if name not in API_DEFAULTS:
+        return False
+    API_CONFIG[name] = url
+    _save_api_config(API_CONFIG)
+    return True
+
+
+def reset_api():
+    global API_CONFIG
+    API_CONFIG = dict(API_DEFAULTS)
+    _save_api_config(API_CONFIG)
+
+
+# ====================== POOL STORAGE ======================
+def load_pool(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except Exception:
+        return []
+
+
+def save_pool(path: str, items: list):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            for s in items:
+                f.write(s + "\n")
+    except Exception as e:
+        log_system("FS", f"save pool {path} failed: {e}", "error")
+
+
+def append_pool(path: str, items: list):
+    try:
+        existing = set(load_pool(path))
+        with open(path, 'a', encoding='utf-8') as f:
+            for s in items:
+                if s not in existing:
+                    f.write(s + "\n")
+                    existing.add(s)
+    except Exception as e:
+        log_system("FS", f"append pool {path} failed: {e}", "error")
+
+
+# ====================== HTTP SESSIONS ======================
+_GLOBAL_HTTP = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _GLOBAL_HTTP
+    if _GLOBAL_HTTP is None or _GLOBAL_HTTP.closed:
+        _GLOBAL_HTTP = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=API_TIMEOUT, connect=15),
+            connector=aiohttp.TCPConnector(
+                limit=500, limit_per_host=200,
+                ttl_dns_cache=600, use_dns_cache=True,
+                enable_cleanup_closed=True,
+            ),
+        )
+    return _GLOBAL_HTTP
+
+
+# ====================== SEMAPHORES ======================
+_USER_SEMS = {}
+
+
+def get_sem(uid, name="search"):
+    key = (uid, name)
+    sem = _USER_SEMS.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(TEST_WORKERS)
+        _USER_SEMS[key] = sem
+    return sem
+
+
+def cleanup_sem(uid):
+    for k in [k for k in list(_USER_SEMS.keys()) if k[0] == uid]:
+        _USER_SEMS.pop(k, None)
+
+
+# ====================== NORMALIZERS ======================
+def norm_shopify(raw) -> str:
+    if not raw:
+        return ""
+    s = str(raw).strip().lower()
+    s = re.sub(r'^https?://', '', s)
+    s = s.rstrip('/').split('/')[0].split('?')[0]
+    if s.startswith('www.'):
+        s = s[4:]
+    if not s or '.' not in s:
+        return ""
+    if not re.match(
+        r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$',
+        s
+    ):
+        return ""
+    return s
+
+
+def norm_rz(raw) -> str:
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if not s.startswith(('http://', 'https://')):
+        s = 'https://' + s
+    return s.rstrip('/')
+
+
+def is_valid_shop_domain(d: str) -> bool:
+    return bool(re.match(
+        r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$',
+        d or ""))
+
+
+# ====================== SHOPIFY DISCOVERY ======================
+def _walk_urls(obj, depth=0):
+    if depth > 6:
+        return
+    if isinstance(obj, str):
+        if "myshopify.com" in obj or (obj.startswith("http") and "." in obj):
+            yield obj
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_urls(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_urls(v, depth + 1)
+
+
+async def _sh_fetch_from_directory(keyword: str, count: int) -> list:
+    session = await get_http_session()
+    out, seen = [], set()
+    kw = (keyword or random.choice(SHOPIFY_STEMS)).strip().lower()
+    params = {"query": kw, "limit": min(count, 250)}
+    for url in SHOPIFY_DIRS:
+        if len(out) >= count:
+            break
+        try:
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as r:
+                if r.status != 200:
+                    continue
+                try:
+                    data = await r.json(content_type=None)
+                except Exception:
+                    continue
+                for u in _walk_urls(data):
+                    d = norm_shopify(u)
+                    if d and d not in seen:
+                        seen.add(d)
+                        out.append(d)
+                        if len(out) >= count:
+                            break
+        except Exception:
+            continue
+    return out
+
+
+async def _sh_stem_fallback(keyword: str, count: int) -> list:
+    out, seen = [], set()
+    stems = list(SHOPIFY_STEMS)
+    if keyword:
+        k = re.sub(r'[^a-z0-9\-]', '', keyword.lower())
+        if k:
+            stems = [k] + [f"{k}{s}" for s in ("shop", "store", "co")] + stems
+    suffixes = ["", "shop", "store", "co", "us", "uk", "app", "online"]
+    for stem in stems:
+        if len(out) >= count:
+            break
+        stem = re.sub(r'[^a-z0-9\-]', '', stem.lower())
+        if not stem:
+            continue
+        for suf in suffixes:
+            if len(out) >= count:
+                break
+            d = f"{stem}{suf}.myshopify.com"
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+    return out
+
+
+async def harvest_shopify(keyword: str = "", count: int = 200) -> list:
+    """Combine directory + fallback, dedupe, return raw candidates."""
+    out, seen = [], set()
+    try:
+        a = await _sh_fetch_from_directory(keyword, count)
+        for d in a:
+            if d not in seen:
+                seen.add(d); out.append(d)
+    except Exception as e:
+        log_system("SH_HARVEST", f"directory failed: {e}", "warning")
+    if len(out) < count:
+        b = await _sh_stem_fallback(keyword, count - len(out))
+        for d in b:
+            if d not in seen:
+                seen.add(d); out.append(d)
+    return out[:count]
+
+
+async def sh_deep(seed: str, count: int = 200) -> list:
+    """Given a seed domain, extract sibling keywords and re-harvest."""
+    seed_clean = norm_shopify(seed)
+    if not seed_clean:
+        return []
+    # Use the seed's SLD as a keyword anchor
+    parts = seed_clean.split('.')
+    keyword = parts[0] if parts else ""
+    keyword = re.sub(r'[^a-z0-9]', '', keyword)
+    return await harvest_shopify(keyword, count)
+
+
+# ====================== RAZORPAY DISCOVERY ======================
+def _rz_candidates(keywords: list, count: int) -> list:
+    seen, out = set(), []
+    hints = list(RZ_STEMS)
+    for kw in keywords:
+        k = re.sub(r'[^a-z0-9\-]', '', kw.lower())
+        if k:
+            hints = [k] + [f"{k}{s}" for s in ("now", "pay", "donate", "page")] + hints
+    for slug in hints:
+        if len(out) >= count:
+            break
+        u = f"https://pages.razorpay.com/{slug}"
+        if u not in seen:
+            seen.add(u); out.append(u)
+    # iic-city patterns
+    for city in ["delhi", "mumbai", "bangalore", "chennai", "kolkata", "pune",
+                 "hyderabad", "ahmedabad", "jaipur", "lucknow"]:
+        if len(out) >= count:
+            break
+        for prefix in ("iic", "pg", "razor", "pay"):
+            u = f"https://pages.razorpay.com/{prefix}{city}"
+            if u not in seen:
+                seen.add(u); out.append(u)
+            if len(out) >= count:
+                break
+    return out[:count]
+
+
+async def harvest_razorpay(keyword: str = "", count: int = 200) -> list:
+    keywords = [k.strip() for k in keyword.split(",") if k.strip()] if keyword else []
+    return _rz_candidates(keywords, count)
+
+
+# ====================== API TESTERS ======================
+async def test_shopify_site(site: str) -> dict:
+    if not site:
+        return {"site": site, "status": "dead", "price": "-", "msg": "empty"}
+    base = get_api("shopify")
+    if not site.startswith('http'):
+        site = f'https://{site}'
+    url = f"{base}?site={quote(site, safe='')}&cc={quote(TEST_CARD, safe='')}"
+    session = await get_http_session()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(
+                total=API_TIMEOUT, connect=15)) as r:
+            if r.status != 200:
+                return {"site": site, "status": "dead",
+                        "price": "-", "msg": f"HTTP_{r.status}"}
+            try:
+                rj = await r.json(content_type=None)
+            except Exception:
+                return {"site": site, "status": "dead",
+                        "price": "-", "msg": "bad json"}
+    except Exception as e:
+        return {"site": site, "status": "dead", "price": "-",
+                "msg": str(e)[:60]}
+
+    resp = str(rj.get('Response', rj.get('response', '')) or '')
+    raw_price = rj.get('Price', rj.get('price', '-'))
+    price_val = 0.0
+    if raw_price is not None and raw_price != '-':
+        try:
+            price_val = float(str(raw_price).replace('$', '').strip())
+        except Exception:
+            pass
+
+    low = resp.lower()
+    dead_markers = [
+        "shop not found", "store not found", "site not found",
+        "invalid site", "invalid store", "no such shop",
+        "could not resolve", "dns error", "unavailable",
+        "currently unavailable", "store closed", "shop closed",
+        "password protected", "not shopify", "no products",
+        "no valid products", "failed to detect product",
+    ]
+    if any(k in low for k in dead_markers):
+        return {"site": site, "status": "dead", "price": "-",
+                "msg": resp[:60]}
+
+    # Anything that hit the API and didn't hard-die is alive
+    return {
+        "site": site,
+        "status": "alive",
+        "price": f"${price_val:.2f}" if price_val > 0 else "-",
+        "msg": resp[:60] or "reached",
+    }
+
+
+async def test_rz_site(site: str) -> dict:
+    if not site:
+        return {"site": site, "status": "dead", "msg": "empty"}
+    base = get_api("razorpay")
+    url = f"{base}?cc={quote(TEST_CARD, safe='')}"
+    session = await get_http_session()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(
+                total=API_TIMEOUT, connect=15)) as r:
+            if r.status != 200:
+                return {"site": site, "status": "dead",
+                        "msg": f"HTTP_{r.status}"}
+            try:
+                rj = await r.json(content_type=None)
+            except Exception:
+                return {"site": site, "status": "dead", "msg": "bad json"}
+    except Exception as e:
+        return {"site": site, "status": "dead", "msg": str(e)[:60]}
+
+    resp = str(rj.get('response', rj.get('Response', '')) or '')
+    low = resp.lower()
+    dead_markers = [
+        "payment id not found", "invalid", "not found",
+        "does not exist", "no such", "expired", "inactive",
+        "page not found", "does not exist",
+    ]
+    if not resp or any(k in low for k in dead_markers):
+        return {"site": site, "status": "dead", "msg": resp[:60] or "empty"}
+    return {"site": site, "status": "alive", "msg": resp[:60] or "reached"}
+
+
+# ====================== TEST RUNNER (STREAMING UI) ======================
+async def run_tester(event, uid: int, candidates: list, mode: str,
+                      status_msg, save_pool: bool = True):
+    """
+    mode: 'shopify' | 'razorpay'
+    Streams progress; saves alive results to pool file if save_pool=True.
+    """
+    sem = get_sem(uid, mode)
+    tester = test_shopify_site if mode == "shopify" else test_rz_site
+    pool_file = SHOPIFY_POOL_FILE if mode == "shopify" else RZ_POOL_FILE
+    meta_file = SHOPIFY_META_FILE if mode == "shopify" else RZ_META_FILE
+
+    alive, dead = [], []
+    done = [0]
+    last_edit = [time.time()]
+
+    async def _one(cand):
+        async with sem:
+            res = await tester(cand)
+        done[0] += 1
+        if res["status"] == "alive":
+            alive.append(res["site"])
+        else:
+            dead.append(res["site"])
+        # Streaming update every 2s
+        if time.time() - last_edit[0] >= 2.0 or done[0] == len(candidates):
+            last_edit[0] = time.time()
+            tag = "✅" if res["status"] == "alive" else "❌"
+            short_site = res["site"][-42:]
+            short_msg = (res.get("msg") or "")[:30]
+            try:
+                await styled_edit(status_msg, pe(
+                    f"💎 <b>{bs('Testing')}</b> · {mode.upper()}\n"
+                    f"{SEP}\n"
+                    f"📊 [{done[0]}/{len(candidates)}]\n"
+                    f"{tag} <code>{short_site}</code>\n"
+                    f"📝 <i>{short_msg}</i>\n"
+                    f"{SEP}\n"
+                    f"✅ {bs('Alive')}: <code>{len(alive)}</code> · "
+                    f"❌ {bs('Dead')}: <code>{len(dead)}</code>"
+                ), emoji_ids=[PE, PE])
+            except Exception:
+                pass
+
+    try:
+        for i in range(0, len(candidates), TEST_WORKERS):
+            batch = candidates[i:i + TEST_WORKERS]
+            await asyncio.gather(*[_one(c) for c in batch])
+    finally:
+        cleanup_sem(uid)
+
+    # Persist
+    added = 0
+    if save_pool and alive:
+        existing = set(load_pool(pool_file))
+        new = [a for a in alive if a not in existing]
+        if new:
+            append_pool(pool_file, new)
+            added = len(new)
+        # Update meta
+        meta = _read_json(meta_file, {})
+        meta["last_run"] = datetime.now().isoformat()
+        meta["total_runs"] = int(meta.get("total_runs", 0)) + 1
+        meta["last_found"] = len(alive)
+        meta["last_added"] = added
+        _write_json(meta_file, meta)
+
+    final_text = pe(f"""✅ <b>{bs('Search Complete')}</b>
+{SEP}
+🎯 {bs('Mode')}: <code>{mode.upper()}</code>
+📥 {bs('Tested')}: <code>{len(candidates)}</code>
+✅ {bs('Alive')}: <code>{len(alive)}</code>
+❌ {bs('Dead')}: <code>{len(dead)}</code>
+{SEP}
+➕ {bs('New added')}: <code>{added}</code>
+📁 {bs('Pool total')}: <code>{len(load_pool(pool_file))}</code>
+{SEP}
+💡 {bs('Download with')} <code>• /shsave</code> / <code>• /rzsave</code>""")
+
+    buttons = []
+    if mode == "shopify":
+        buttons.append([pbtn(bs("📥 Download pool"), data=f"download_shopify:{uid}")])
+    else:
+        buttons.append([pbtn(bs("📥 Download pool"), data=f"download_razorpay:{uid}")])
+    buttons.append([pbtn(bs("🔙 Menu"), data="main_menu")])
+
+    try:
+        await styled_edit(status_msg, final_text, buttons=buttons,
+                          emoji_ids=[PE, PE, PE, PE, PE, PE])
+    except Exception:
+        pass
+
+
+# ====================== CANDIDATE PREVIEW ======================
+def _preview_lines(items: list, n: int = 12) -> str:
+    lines = []
+    for i, s in enumerate(items[:n], 1):
+        lines.append(f"{i}. <code>{s}</code>")
+    if len(items) > n:
+        lines.append(f"<i>… +{len(items) - n} more</i>")
+    return "\n".join(lines) if lines else "<i>empty</i>"
+
+
+# ====================== COMMANDS ======================
+
+@client.on(events.NewMessage(pattern=r'^[/.]start$'))
+async def cmd_start(event):
+    uid = event.sender_id
+    is_admin = uid in ADMIN_ID
+    tier = "👑 Admin" if is_admin else "🆓 Free"
+    text = pe(f"""{SEP}
+    ✨ {bs('NOVA FINDER')} ✨
+{SEP}
+👤 {bs('User')}: <code>{uid}</code>
+📊 {bs('Tier')}: {tier}
+{SEP}
+🔍 <b>{bs('Shopify Discovery')}</b>
+┣ <code>• /shsearch [count] [keyword]</code>
+┣ <code>• /shdeep seed</code>
+┗ <code>• /shsave</code> · <code>• /shstats</code> · <code>• /shclear</code>
+{SEP}
+💳 <b>{bs('Razorpay Discovery')}</b>
+┣ <code>• /rzsearch [count] [keywords]</code>
+┗ <code>• /rzsave</code> · <code>• /rzstats</code> · <code>• /rzclear</code>
+{SEP}
+⚙️ <b>{bs('Admin')}</b>
+┣ <code>• /setapi shopify URL</code>
+┣ <code>• /setapi razorpay URL</code>
+┗ <code>• /resetapi</code>
+{SEP}
+{DEV_LINE}""")
+
+    buttons = [
+        [pbtn(bs("🔍 Shopify"), data="menu_shopify"),
+         pbtn(bs("💳 Razorpay"), data="menu_razorpay")],
+        [pbtn(bs("📊 Stats"), data="menu_stats"),
+         pbtn(bs("❌ Close"), data="close_menu")],
+    ]
+    if is_admin:
+        buttons.append([pbtn(bs("👑 Admin"), data="menu_admin")])
+    await styled_reply(event, text, buttons=buttons,
+                        emoji_ids=[PE, PE, PE, PE])
+
+
+@client.on(events.CallbackQuery(data=b"main_menu"))
+async def cb_main(event):
+    await event.answer()
+    uid = event.sender_id
+    is_admin = uid in ADMIN_ID
+    text = pe(f"""💎 <b>{bs('NOVA FINDER')}</b>
+{SEP}
+👤 <code>{uid}</code>
+{SEP}
+💡 {bs('Pick a search mode')}""")
+    buttons = [
+        [pbtn(bs("🔍 Shopify"), data="menu_shopify"),
+         pbtn(bs("💳 Razorpay"), data="menu_razorpay")],
+        [pbtn(bs("📊 Stats"), data="menu_stats"),
+         pbtn(bs("❌ Close"), data="close_menu")],
+    ]
+    if is_admin:
+        buttons.append([pbtn(bs("👑 Admin"), data="menu_admin")])
+    try:
+        await event.edit(*build_entities(text), buttons=buttons,
+                         link_preview=False)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(data=b"close_menu"))
+async def cb_close(event):
+    await event.answer()
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(data=b"menu_shopify"))
+async def cb_menu_shopify(event):
+    await event.answer()
+    text = pe(f"""🔍 <b>{bs('Shopify Discovery')}</b>
+{SEP}
+📥 <code>• /shsearch 500</code>
+📥 <code>• /shsearch 300 coffee</code>
+🌱 <code>• /shdeep seed.myshopify.com</code>
+{SEP}
+📁 <code>• /shsave</code>  ·  📊 <code>• /shstats</code>
+🗑 <code>• /shclear</code>
+{SEP}
+💡 {bs('Sites are auto-tested and saved to')} <code>shopify_pool.txt</code>""")
+    buttons = [
+        [pbtn(bs("🔙 Back"), data="main_menu")],
+    ]
+    try:
+        await event.edit(*build_entities(text), buttons=buttons,
+                         link_preview=False)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(data=b"menu_razorpay"))
+async def cb_menu_razorpay(event):
+    await event.answer()
+    text = pe(f"""💳 <b>{bs('Razorpay Discovery')}</b>
+{SEP}
+📥 <code>• /rzsearch 500</code>
+📥 <code>• /rzsearch 300 donate,pay,seva</code>
+{SEP}
+📁 <code>• /rzsave</code>  ·  📊 <code>• /rzstats</code>
+🗑 <code>• /rzclear</code>
+{SEP}
+💡 {bs('Pages are auto-tested and saved to')} <code>rz_pool.txt</code>""")
+    buttons = [
+        [pbtn(bs("🔙 Back"), data="main_menu")],
+    ]
+    try:
+        await event.edit(*build_entities(text), buttons=buttons,
+                         link_preview=False)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(data=b"menu_stats"))
+async def cb_menu_stats(event):
+    await event.answer()
+    sh_pool = load_pool(SHOPIFY_POOL_FILE)
+    rz_pool = load_pool(RZ_POOL_FILE)
+    sh_meta = _read_json(SHOPIFY_META_FILE, {})
+    rz_meta = _read_json(RZ_META_FILE, {})
+    sh_last = sh_meta.get("last_run", "-")[:19] if sh_meta.get("last_run") else "-"
+    rz_last = rz_meta.get("last_run", "-")[:19] if rz_meta.get("last_run") else "-"
+    text = pe(f"""📊 <b>{bs('Pool Stats')}</b>
+{SEP}
+🔍 <b>Shopify</b>
+┣ {bs('Pool size')}: <code>{len(sh_pool)}</code>
+┣ {bs('Runs')}: <code>{sh_meta.get('total_runs', 0)}</code>
+┗ {bs('Last run')}: <code>{sh_last}</code>
+{SEP}
+💳 <b>Razorpay</b>
+┣ {bs('Pool size')}: <code>{len(rz_pool)}</code>
+┣ {bs('Runs')}: <code>{rz_meta.get('total_runs', 0)}</code>
+┗ {bs('Last run')}: <code>{rz_last}</code>
+{SEP}
+{DEV_LINE}""")
+    buttons = [[pbtn(bs("🔙 Back"), data="main_menu")]]
+    try:
+        await event.edit(*build_entities(text), buttons=buttons,
+                         link_preview=False)
+    except Exception:
+        pass
+
+
+@client.on(events.CallbackQuery(data=b"menu_admin"))
+async def cb_menu_admin(event):
+    if event.sender_id not in ADMIN_ID:
+        return await event.answer("Access denied", alert=True)
+    await event.answer()
+    text = pe(f"""👑 <b>{bs('Admin Panel')}</b>
+{SEP}
+🔌 <b>{bs('API Endpoints')}</b>
+┣ 🛒 <code>{get_api('shopify')[:60]}</code>
+┗ 💳 <code>{get_api('razorpay')[:60]}</code>
+{SEP}
+⚙️ <code>• /setapi shopify URL</code>
+⚙️ <code>• /setapi razorpay URL</code>
+⚙️ <code>• /resetapi</code>
+{SEP}
+👑 <code>• /addadmin ID</code>
+👑 <code>• /removeadmin ID</code>""")
+    buttons = [[pbtn(bs("🔙 Back"), data="main_menu")]]
+    try:
+        await event.edit(*build_entities(text), buttons=buttons,
+                         link_preview=False)
+    except Exception:
+        pass
+
+
+# ====================== SEARCH COMMANDS ======================
+@client.on(events.NewMessage(pattern=r'^[/.]shsearch(?:\s+(.+))?$'))
+async def cmd_shsearch(event):
+    uid = event.sender_id
+    arg = (event.pattern_match.group(1) or "").strip()
+    count = 200
+    keyword = ""
+    if arg:
+        parts = arg.split(maxsplit=1)
+        if parts[0].isdigit():
+            count = max(10, min(int(parts[0]), 2000))
+            keyword = parts[1] if len(parts) > 1 else ""
+        else:
+            keyword = arg
+
+    cap = MAX_POOL_ADMIN if uid in ADMIN_ID else MAX_POOL_USER
+    existing_pool = load_pool(SHOPIFY_POOL_FILE)
+    if len(existing_pool) >= cap:
+        return await styled_reply(event, pe(
+            f"⚠️ <b>{bs('Pool cap reached')}</b>\n"
+            f"📁 <code>{len(existing_pool)}/{cap}</code>\n"
+            f"💡 {bs('Run')} <code>• /shclear</code> {bs('or use')} <code>/shsave</code>"),
+            emoji_ids=[PE])
+
+    status_msg = await styled_reply(event, pe(
+        f"💎 <b>{bs('Harvesting Shopify candidates')}</b>\n"
+        f"🎯 <code>{count}</code> · 🔑 <code>{keyword or 'auto'}</code>"),
+        emoji_ids=[PE, PE])
+    st = time.time()
+    candidates = await harvest_shopify(keyword, count)
+    if not candidates:
+        return await styled_edit(status_msg, pe(
+            f"❌ <b>{bs('No candidates found')}</b>"), emoji_ids=[PE])
+    try:
+        await styled_edit(status_msg, pe(
+            f"💎 <b>{bs('Testing')}</b> <code>{len(candidates)}</code> {bs('candidates')}...\n"
+            f"{SEP}\n{_preview_lines(candidates, 6)}"),
+            emoji_ids=[PE])
+    except Exception:
+        pass
+    await run_tester(event, uid, candidates, "shopify", status_msg, save_pool=True)
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]rzsearch(?:\s+(.+))?$'))
+async def cmd_rzsearch(event):
+    uid = event.sender_id
+    arg = (event.pattern_match.group(1) or "").strip()
+    count = 200
+    keyword = ""
+    if arg:
+        parts = arg.split(maxsplit=1)
+        if parts[0].isdigit():
+            count = max(10, min(int(parts[0]), 2000))
+            keyword = parts[1] if len(parts) > 1 else ""
+        else:
+            keyword = arg
+
+    cap = MAX_POOL_ADMIN if uid in ADMIN_ID else MAX_POOL_USER
+    existing_pool = load_pool(RZ_POOL_FILE)
+    if len(existing_pool) >= cap:
+        return await styled_reply(event, pe(
+            f"⚠️ <b>{bs('Pool cap reached')}</b>\n"
+            f"📁 <code>{len(existing_pool)}/{cap}</code>\n"
+            f"💡 {bs('Run')} <code>• /rzclear</code> {bs('or use')} <code>/rzsave</code>"),
+            emoji_ids=[PE])
+
+    status_msg = await styled_reply(event, pe(
+        f"💎 <b>{bs('Generating Razorpay candidates')}</b>\n"
+        f"🎯 <code>{count}</code> · 🔑 <code>{keyword or 'auto'}</code>"),
+        emoji_ids=[PE, PE])
+    candidates = await harvest_razorpay(keyword, count)
+    if not candidates:
+        return await styled_edit(status_msg, pe(
+            f"❌ <b>{bs('No candidates generated')}</b>"), emoji_ids=[PE])
+    try:
+        await styled_edit(status_msg, pe(
+            f"💎 <b>{bs('Testing')}</b> <code>{len(candidates)}</code> {bs('pages')}...\n"
+            f"{SEP}\n{_preview_lines(candidates, 6)}"),
+            emoji_ids=[PE])
+    except Exception:
+        pass
+    await run_tester(event, uid, candidates, "razorpay", status_msg, save_pool=True)
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]shdeep\s+(.+)$'))
+async def cmd_shdeep(event):
+    uid = event.sender_id
+    seed = event.pattern_match.group(1).decode().strip()
+    if not seed:
+        return await styled_reply(event, pe(f"💎 <code>• /shdeep seed.myshopify.com</code>"),
+                                   emoji_ids=[PE])
+    status_msg = await styled_reply(event, pe(
+        f"💎 <b>{bs('Expanding from seed')}</b>\n"
+        f"🌱 <code>{seed}</code>"), emoji_ids=[PE, PE])
+    candidates = await sh_deep(seed, 300)
+    if not candidates:
+        return await styled_edit(status_msg, pe(
+            f"❌ <b>{bs('No candidates from seed')}</b>"), emoji_ids=[PE])
+    try:
+        await styled_edit(status_msg, pe(
+            f"💎 <b>{bs('Testing')}</b> <code>{len(candidates)}</code> {bs('seeds')}...\n"
+            f"{SEP}\n{_preview_lines(candidates, 6)}"),
+            emoji_ids=[PE])
+    except Exception:
+        pass
+    await run_tester(event, uid, candidates, "shopify", status_msg, save_pool=True)
+
+
+# ====================== POOL MANAGEMENT ======================
+@client.on(events.NewMessage(pattern=r'^[/.]shsave$'))
+async def cmd_shsave(event):
+    return await _do_save(event, "shopify")
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]rzsave$'))
+async def cmd_rzsave(event):
+    return await _do_save(event, "razorpay")
+
+
+async def _do_save(event, mode: str):
+    uid = event.sender_id
+    path = SHOPIFY_POOL_FILE if mode == "shopify" else RZ_POOL_FILE
+    pool = load_pool(path)
+    if not pool:
+        return await styled_reply(event, pe(
+            f"💎 <b>{bs('Pool empty')}</b>"), emoji_ids=[PE])
+    fname = f"{mode}_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        async with aiofiles.open(fname, 'w', encoding='utf-8') as f:
+            for s in pool:
+                await f.write(s + "\n")
+        await send_file_entities(uid, fname, pe(
+            f"📁 <b>{bs(mode.title())} Pool</b> — <code>{len(pool)}</code>"),
+            emoji_ids=[PE, PE])
+        os.remove(fname)
+    except Exception as e:
+        await styled_reply(event, pe(f"❌ <code>{e}</code>"), emoji_ids=[PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]shstats$'))
+async def cmd_shstats(event):
+    return await _do_stats(event, "shopify")
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]rzstats$'))
+async def cmd_rzstats(event):
+    return await _do_stats(event, "razorpay")
+
+
+async def _do_stats(event, mode: str):
+    path = SHOPIFY_POOL_FILE if mode == "shopify" else RZ_POOL_FILE
+    meta_path = SHOPIFY_META_FILE if mode == "shopify" else RZ_META_FILE
+    pool = load_pool(path)
+    meta = _read_json(meta_path, {})
+    last = meta.get("last_run", "-")[:19] if meta.get("last_run") else "-"
+    sample = _preview_lines(pool, 10)
+    label = "Shopify" if mode == "shopify" else "Razorpay"
+    text = pe(f"""📊 <b>{bs(label)} Pool</b>
+{SEP}
+📁 {bs('Size')}: <code>{len(pool)}</code>
+🔁 {bs('Runs')}: <code>{meta.get('total_runs', 0)}</code>
+✅ {bs('Last found')}: <code>{meta.get('last_found', 0)}</code>
+➕ {bs('Last added')}: <code>{meta.get('last_added', 0)}</code>
+🕐 {bs('Last run')}: <code>{last}</code>
+{SEP}
+{bs('Sample')}:
+{sample}""")
+    await styled_reply(event, text, emoji_ids=[PE, PE, PE, PE, PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]shclear$'))
+async def cmd_shclear(event):
+    return await _do_clear(event, "shopify")
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]rzclear$'))
+async def cmd_rzclear(event):
+    return await _do_clear(event, "razorpay")
+
+
+async def _do_clear(event, mode: str):
+    uid = event.sender_id
+    if uid not in ADMIN_ID:
+        return await styled_reply(event, pe(f"⚠️ <b>{bs('Admin only')}</b>"),
+                                   emoji_ids=[PE])
+    path = SHOPIFY_POOL_FILE if mode == "shopify" else RZ_POOL_FILE
+    n = len(load_pool(path))
+    save_pool(path, [])
+    await styled_reply(event, pe(
+        f"✅ <b>{bs('Cleared')}</b> <code>{n}</code>"), emoji_ids=[PE])
+
+
+# ====================== DOWNLOAD CALLBACK ======================
+@client.on(events.CallbackQuery(pattern=rb"^download_(shopify|razorpay):(\d+)$"))
+async def cb_download(event):
+    mode = event.pattern_match.group(1).decode()
+    owner = int(event.pattern_match.group(2).decode())
+    if event.sender_id != owner:
+        return await event.answer("Not yours!", alert=True)
+    path = SHOPIFY_POOL_FILE if mode == "shopify" else RZ_POOL_FILE
+    pool = load_pool(path)
+    if not pool:
+        return await event.answer("Pool empty", alert=True)
+    fname = f"{mode}_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        async with aiofiles.open(fname, 'w', encoding='utf-8') as f:
+            for s in pool:
+                await f.write(s + "\n")
+        await send_file_entities(event.sender_id, fname, pe(
+            f"📁 <b>{bs(mode.title())} Pool</b> — <code>{len(pool)}</code>"),
+            emoji_ids=[PE, PE])
+        os.remove(fname)
+    except Exception as e:
+        log_system("DOWNLOAD", f"failed: {e}", "error")
+    await event.answer("Sent!", alert=False)
+
+
+# ====================== API ADMIN ======================
+@client.on(events.NewMessage(pattern=r'^[/.]setapi\s+'))
+async def cmd_setapi(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    parts = event.raw_text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await styled_reply(event, pe(
+            f"💎 <code>• /setapi shopify https://...</code>\n"
+            f"<code>• /setapi razorpay https://...</code>"), emoji_ids=[PE])
+    target = parts[1].strip().lower()
+    url = parts[2].strip()
+    if target not in ("shopify", "razorpay"):
+        return await styled_reply(event, pe(
+            f"❌ <b>{bs('Unknown target')}</b>: <code>{target}</code>"),
+            emoji_ids=[PE])
+    if not url.startswith(("http://", "https://")):
+        return await styled_reply(event, pe(
+            f"❌ <b>{bs('URL must start with http')}</b>"), emoji_ids=[PE])
+    set_api(target, url)
+    await styled_reply(event, pe(
+        f"✅ <b>{bs('API updated')}</b>\n"
+        f"🔌 <b>{bs(target.title())}</b>: <code>{url}</code>"),
+        emoji_ids=[PE, PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]resetapi$'))
+async def cmd_resetapi(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    reset_api()
+    await styled_reply(event, pe(
+        f"✅ <b>{bs('API reset')}</b>\n"
+        f"🛒 <code>{get_api('shopify')}</code>\n"
+        f"💳 <code>{get_api('razorpay')}</code>"),
+        emoji_ids=[PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]api$'))
+async def cmd_api(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    await styled_reply(event, pe(
+        f"🔌 <b>{bs('API Endpoints')}</b>\n{SEP}\n"
+        f"🛒 Shopify: <code>{get_api('shopify')}</code>\n"
+        f"💳 Razorpay: <code>{get_api('razorpay')}</code>\n{SEP}\n"
+        f"💡 <code>• /setapi shopify URL</code>\n"
+        f"<code>• /setapi razorpay URL</code>\n"
+        f"<code>• /resetapi</code>"),
+        emoji_ids=[PE, PE])
+
+
+# ====================== ADMIN MGMT ======================
+@client.on(events.NewMessage(pattern=r'^[/.]addadmin\s+'))
+async def cmd_addadmin(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await styled_reply(event, pe(f"💎 <code>• /addadmin ID</code>"),
+                                   emoji_ids=[PE])
+    try:
+        t = int(parts[1])
+    except ValueError:
+        return await styled_reply(event, pe(f"❌ <b>{bs('Invalid ID')}</b>"),
+                                   emoji_ids=[PE])
+    if t in ADMIN_ID:
+        return await styled_reply(event, pe(f"💎 <b>{bs('Already admin')}</b>"),
+                                   emoji_ids=[PE])
+    ADMIN_ID.append(t)
+    _save_admins()
+    await styled_reply(event, pe(f"✅ <b>{bs('Admin added')}</b> <code>{t}</code>"),
+                        emoji_ids=[PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]removeadmin\s+'))
+async def cmd_removeadmin(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await styled_reply(event, pe(f"💎 <code>• /removeadmin ID</code>"),
+                                   emoji_ids=[PE])
+    try:
+        t = int(parts[1])
+    except ValueError:
+        return await styled_reply(event, pe(f"❌ <b>{bs('Invalid ID')}</b>"),
+                                   emoji_ids=[PE])
+    if t not in ADMIN_ID:
+        return await styled_reply(event, pe(f"💎 <b>{bs('Not an admin')}</b>"),
+                                   emoji_ids=[PE])
+    if len(ADMIN_ID) <= 1:
+        return await styled_reply(event, pe(f"❌ <b>{bs('Cannot remove last admin')}</b>"),
+                                   emoji_ids=[PE])
+    ADMIN_ID.remove(t)
+    _save_admins()
+    await styled_reply(event, pe(f"✅ <b>{bs('Admin removed')}</b> <code>{t}</code>"),
+                        emoji_ids=[PE])
+
+
+# ====================== UTILITY ======================
+@client.on(events.NewMessage(pattern=r'^[/.]ping$'))
+async def cmd_ping(event):
+    t = time.time()
+    m = await styled_reply(event, pe("🏓 ..."))
+    if m:
+        try:
+            await m.edit(pe(f"🏓 <b>{bs('Pong')}</b> <code>{(time.time()-t)*1000:.1f}ms</code>"),
+                         parse_mode='html')
+        except Exception:
+            pass
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]status$'))
+async def cmd_status(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    if not PSUTIL_AVAILABLE:
+        return await styled_reply(event, pe(f"💎 <i>psutil unavailable</i>"),
+                                   emoji_ids=[PE])
+    try:
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        text = pe(f"""💎 <b>{bs('System Status')}</b>
+{SEP}
+💻 CPU: <code>{cpu}%</code>
+🧠 RAM: <code>{mem.percent}%</code> ({mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB)
+💾 Disk: <code>{disk.percent}%</code>
+{SEP}
+📁 Shopify pool: <code>{len(load_pool(SHOPIFY_POOL_FILE))}</code>
+💳 Razorpay pool: <code>{len(load_pool(RZ_POOL_FILE))}</code>""")
+        await styled_reply(event, text, emoji_ids=[PE, PE])
+    except Exception as e:
+        await styled_reply(event, pe(f"❌ <code>{e}</code>"), emoji_ids=[PE])
+
+
+@client.on(events.NewMessage(pattern=r'^[/.]version$'))
+async def cmd_version(event):
+    if event.sender_id not in ADMIN_ID:
+        return
+    await styled_reply(event, pe(
+        f"🤖 <b>{bs('NOVA Finder')}</b>\n{SEP}\n"
+        f"📦 Version: <code>v1.0.0</code>\n"
+        f"🛒 Shopify API: <code>{get_api('shopify')[:60]}</code>\n"
+        f"💳 Razorpay API: <code>{get_api('razorpay')[:60]}</code>\n"
+        f"⚙️ Test workers: <code>{TEST_WORKERS}</code>"),
+        emoji_ids=[PE, PE])
+
+
+# ====================== MAIN ======================
+async def main():
+    global client_instance
+    client_instance = client
+
+    _load_admins()
+
+    log_system("BOOT", "Starting NOVA Finder v1.0.0...")
+    log_system("BOOT", f"Shopify API: {get_api('shopify')}")
+    log_system("BOOT", f"Razorpay API: {get_api('razorpay')}")
+    log_system("BOOT", f"Admins: {ADMIN_ID}")
+
+    if not BOT_TOKEN:
+        log_system("BOOT", "BOT_TOKEN not set — aborting", "error")
+        return
+
+    for f in (SHOPIFY_POOL_FILE, RZ_POOL_FILE):
+        if not os.path.exists(f):
+            open(f, 'a').close()
+
+    while True:
+        try:
+            log_system("BOOT", "Connecting...")
+            await client.start(bot_token=BOT_TOKEN)
+            log_system("BOOT", "✅ Finder online.")
+            me = await client.get_me()
+            log_system("BOOT", f"  bot=@{me.username}  id={me.id}")
+            await client.run_until_disconnected()
+        except FloodWaitError as e:
+            log_system("FLOOD", f"Sleeping {e.seconds + 5}s", "warning")
+            await asyncio.sleep(e.seconds + 5)
+        except Exception as e:
+            log_system("CRASH", f"{type(e).__name__}: {e}", "error")
+            await asyncio.sleep(10)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
