@@ -1,0 +1,27 @@
+# Secrets
+.env
+*.env
+finder_api.json
+finder_admins.json
+
+# Runtime data (regenerated)
+shopify_pool.txt
+rz_pool.txt
+shopify_pool_meta.json
+rz_pool_meta.json
+
+# Logs
+*.log
+nova_finder.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
