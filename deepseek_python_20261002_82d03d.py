@@ -79,7 +79,7 @@ def bs(text):
 API_ID    = int(os.getenv("FINDER_API_ID") or os.getenv("API_ID") or 33657928)
 API_HASH  = os.getenv("FINDER_API_HASH") or os.getenv("API_HASH",
                     "a61fde61442113b9a65c699f7020d59a")
-BOT_TOKEN = os.getenv("FINDER_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("FINDER_BOT_TOKEN") or os.getenv("BOT_TOKEN", "8517366800:AAF3BgDkZ7tY5mWOMu3ztAx31NTVk7xzzcU")
 ADMIN_ID  = [int(x) for x in (os.getenv("FINDER_ADMINS") or
                               "8871910561").split(",") if x.strip()]
 
